@@ -1,3 +1,4 @@
+
 import os
 import asyncio
 import logging
@@ -24,14 +25,12 @@ API_ID = int(os.environ["API_ID"])
 API_HASH = os.environ["API_HASH"]
 TELETHON_SESSION = os.environ["TELETHON_SESSION"]
 
-# Comma-separated group IDs or public @usernames.
 ALLOWED_GROUPS = [
     value.strip()
     for value in os.environ.get("ALLOWED_GROUPS", "").split(",")
     if value.strip()
 ]
 
-# Comma-separated Telegram numeric user IDs allowed to search.
 ADMIN_USER_IDS = {
     int(value.strip())
     for value in os.environ.get("ADMIN_USER_IDS", "").split(",")
@@ -57,10 +56,13 @@ async def post_init(application: Application):
     if not await tg_client.is_user_authorized():
         raise RuntimeError(
             "Telethon session is not authorized. "
-            "Generate a valid session string and update the secret."
+            "Generate a new session string."
         )
 
-    log.info("Telethon connected; allowed groups: %s", len(ALLOWED_GROUPS))
+    log.info(
+        "Telethon connected. Configured groups: %s",
+        len(ALLOWED_GROUPS),
+    )
 
 
 async def post_shutdown(application: Application):
@@ -77,13 +79,16 @@ async def start(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ):
-    if update.effective_message:
-        await update.effective_message.reply_text(
-            "Group-only name search bot\n\n"
-            "Usage: /search Rahul Sharma\n\n"
-            "Searches only the configured groups for accessible "
-            "participants and messages. Results may be incomplete."
-        )
+    if not update.effective_message:
+        return
+
+    await update.effective_message.reply_text(
+        "🔎 Telegram Group Search\n\n"
+        "Usage: /search Rahul Sharma\n\n"
+        "Searches only the configured Telegram groups for "
+        "accessible participants and messages.\n"
+        "Results may be incomplete."
+    )
 
 
 async def search(
@@ -91,26 +96,31 @@ async def search(
     context: ContextTypes.DEFAULT_TYPE,
 ):
     message = update.effective_message
-
     if not message:
         return
 
     if not is_admin(update):
-        await message.reply_text("⛔ You are not authorized to use this bot.")
+        await message.reply_text(
+            "⛔ You are not authorized to use this bot."
+        )
         return
 
     query = " ".join(context.args).strip()
 
     if len(query) < 2:
-        await message.reply_text("Usage: /search Rahul Sharma")
+        await message.reply_text(
+            "Usage: /search Rahul Sharma"
+        )
         return
 
     if len(query) > 80:
-        await message.reply_text("Please use a shorter search query.")
+        await message.reply_text(
+            "Please enter a shorter search query."
+        )
         return
 
     status = await message.reply_text(
-        "🔎 Searching configured Telegram groups..."
+        "🔎 Searching your configured groups..."
     )
 
     output = [f"Results for: {query}", ""]
@@ -119,122 +129,146 @@ async def search(
     try:
         for group_ref in ALLOWED_GROUPS:
             try:
-                entity = await tg_client.get_entity(
-                    int(group_ref) if group_ref.lstrip("-").isdigit()
-                    else group_ref
-                )
+                if group_ref.lstrip("-").isdigit():
+                    entity = await tg_client.get_entity(int(group_ref))
+                else:
+                    entity = await tg_client.get_entity(group_ref)
 
-                group_name = getattr(entity, "title", None) or group_ref
+                group_name = (
+                    getattr(entity, "title", None) or group_ref
+                )
                 public_name = getattr(entity, "username", None)
 
                 output.append(f"📂 Group: {group_name}")
 
-                # Participant search is best-effort and subject to Telegram limits.
+                # Participant search: Telegram may return partial results.
                 try:
                     members = []
+
                     async for user in tg_client.iter_participants(
                         entity,
                         search=query,
                         limit=10,
                     ):
-                        display_name = " ".join(
-                            part for part in [
+                        full_name = " ".join(
+                            part
+                            for part in (
                                 getattr(user, "first_name", None),
                                 getattr(user, "last_name", None),
-                            ] if part
+                            )
+                            if part
                         ) or "(name unavailable)"
 
                         username = (
-                            f"@{user.username}"
+                            "@" + user.username
                             if getattr(user, "username", None)
                             else "No public username"
                         )
 
                         members.append(
-                            f"  • {display_name} — {username}"
+                            f"• {full_name} — {username}"
                         )
 
                     output.append("Members:")
                     output.extend(
-                        members if members else ["  • No accessible matches"]
+                        members or ["• No accessible matches"]
                     )
                     total_hits += len(members)
 
-                except (RPCError, FloodWaitError) as exc:
+                except FloodWaitError as exc:
                     log.warning(
-                        "Member search failed in %s: %s",
-                        group_ref,
+                        "Telegram requested a wait of %s seconds",
+                        exc.seconds,
+                    )
+                    output.append(
+                        "Members: rate limited by Telegram."
+                    )
+
+                except RPCError as exc:
+                    log.warning(
+                        "Member search failed: %s",
                         type(exc).__name__,
                     )
                     output.append(
-                        "Members: unavailable (Telegram access/rate limit)"
+                        "Members: unavailable for this group."
                     )
 
-                # Search messages available to this authorized account.
+                # Search messages accessible to the authorized account.
                 try:
                     messages = []
+
                     async for item in tg_client.iter_messages(
                         entity,
                         search=query,
                         limit=10,
                     ):
                         text = (item.message or "").replace("\n", " ")
-                        if len(text) > 220:
-                            text = text[:217] + "..."
+                        if len(text) > 180:
+                            text = text[:177] + "..."
 
                         if public_name:
                             link = (
                                 f"https://t.me/{public_name}/{item.id}"
                             )
-                            messages.append(f"  • {text}\n    {link}")
+                            messages.append(
+                                f"• {text}\n  {link}"
+                            )
                         else:
-                            messages.append(f"  • {text}")
+                            messages.append(f"• {text or '(no text)'}")
 
                     output.append("Messages:")
                     output.extend(
-                        messages if messages else ["  • No indexed matches"]
+                        messages or ["• No accessible matches"]
                     )
                     total_hits += len(messages)
 
-                except (RPCError, FloodWaitError) as exc:
+                except FloodWaitError as exc:
                     log.warning(
-                        "Message search failed in %s: %s",
-                        group_ref,
+                        "Telegram requested a wait of %s seconds",
+                        exc.seconds,
+                    )
+                    output.append(
+                        "Messages: rate limited by Telegram."
+                    )
+
+                except RPCError as exc:
+                    log.warning(
+                        "Message search failed: %s",
                         type(exc).__name__,
                     )
                     output.append(
-                        "Messages: unavailable (Telegram access/rate limit)"
+                        "Messages: unavailable for this group."
                     )
 
                 output.append("")
 
             except Exception as exc:
                 log.warning(
-                    "Could not access configured group %s: %s",
+                    "Group access failed for %s: %s",
                     group_ref,
                     type(exc).__name__,
                 )
                 output.extend([
                     f"📂 Group: {group_ref}",
-                    "Could not access this group. Check the group reference, "
-                    "membership and permissions.",
+                    "Could not access this group. Check its ID, "
+                    "account membership and permissions.",
                     "",
                 ])
 
         output.append(
             f"Finished. Accessible matches: {total_hits}\n"
-            "Results may be incomplete. A name match does not verify identity."
+            "Results may be incomplete. A match does not verify identity."
         )
 
-        # Keep each Telegram message below its size limit.
-        combined = "\n".join(output)
+        # Split messages without breaking individual lines where possible.
         chunks = []
         current = ""
 
-        for line in combined.splitlines():
-            if len(current) + len(line) + 1 > 3800:
+        for line in "\n".join(output).splitlines():
+            if len(current) + len(line) + 1 > 3800 and current:
                 chunks.append(current)
                 current = ""
+
             current += line + "\n"
 
         if current:
@@ -251,12 +285,12 @@ async def search(
     except Exception:
         log.exception("Search failed")
         await status.edit_text(
-            "Search failed. Check GitHub Actions logs and configured secrets."
+            "Search failed. Check the GitHub Actions logs."
         )
 
 
 def main():
-    application = (
+    app = (
         Application.builder()
         .token(BOT_TOKEN)
         .post_init(post_init)
@@ -264,11 +298,11 @@ def main():
         .build()
     )
 
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("search", search))
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("search", search))
 
-    log.info("Bot starting")
-    application.run_polling()
+    log.info("Starting group-only search bot.")
+    app.run_polling()
 
 
 if __name__ == "__main__":
