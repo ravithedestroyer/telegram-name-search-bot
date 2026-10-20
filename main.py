@@ -1,11 +1,11 @@
-
 import os
 import asyncio
-import re
-from difflib import SequenceMatcher
-from urllib.parse import urlparse, urlunparse, parse_qsl, urlencode
+import logging
 
-from ddgs import DDGS
+from telethon import TelegramClient
+from telethon.sessions import StringSession
+from telethon.errors import FloodWaitError, RPCError
+
 from telegram import Update
 from telegram.ext import (
     Application,
@@ -13,171 +13,76 @@ from telegram.ext import (
     ContextTypes,
 )
 
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(message)s",
+)
+log = logging.getLogger(__name__)
+
 BOT_TOKEN = os.environ["BOT_TOKEN"]
+API_ID = int(os.environ["API_ID"])
+API_HASH = os.environ["API_HASH"]
+TELETHON_SESSION = os.environ["TELETHON_SESSION"]
+
+# Comma-separated group IDs or public @usernames.
+ALLOWED_GROUPS = [
+    value.strip()
+    for value in os.environ.get("ALLOWED_GROUPS", "").split(",")
+    if value.strip()
+]
+
+# Comma-separated Telegram numeric user IDs allowed to search.
+ADMIN_USER_IDS = {
+    int(value.strip())
+    for value in os.environ.get("ADMIN_USER_IDS", "").split(",")
+    if value.strip()
+}
+
+if not ALLOWED_GROUPS:
+    raise RuntimeError("Configure ALLOWED_GROUPS in GitHub Secrets.")
+
+if not ADMIN_USER_IDS:
+    raise RuntimeError("Configure ADMIN_USER_IDS in GitHub Secrets.")
+
+tg_client = TelegramClient(
+    StringSession(TELETHON_SESSION),
+    API_ID,
+    API_HASH,
+)
 
 
-def normalize_url(url: str) -> str:
-    """Remove tracking parameters and URL fragments."""
-    try:
-        parsed = urlparse(url.strip())
-        clean_query = urlencode([
-            (key, value)
-            for key, value in parse_qsl(parsed.query)
-            if not key.lower().startswith("utm_")
-        ])
-        return urlunparse((
-            parsed.scheme or "https",
-            parsed.netloc.lower(),
-            parsed.path.rstrip("/") or "/",
-            "",
-            clean_query,
-            "",
-        ))
-    except Exception:
-        return url.strip()
+async def post_init(application: Application):
+    await tg_client.connect()
+
+    if not await tg_client.is_user_authorized():
+        raise RuntimeError(
+            "Telethon session is not authorized. "
+            "Generate a valid session string and update the secret."
+        )
+
+    log.info("Telethon connected; allowed groups: %s", len(ALLOWED_GROUPS))
 
 
-def search_public_web(name: str) -> list:
-    results = []
-    seen = set()
-    errors = 0
+async def post_shutdown(application: Application):
+    if tg_client.is_connected():
+        await tg_client.disconnect()
 
-    queries = [
-        f'site:t.me "{name}"',
-        f'site:telegram.me "{name}"',
-        f'site:t.me "{name}" Telegram',
-        f'"{name}" Telegram',
-        f'"{name}" site:t.me',
-        f'{name} Telegram public channel',
-    ]
 
-    try:
-        with DDGS() as ddgs:
-            for query in queries:
-                try:
-                    hits = ddgs.text(
-                        query,
-                        max_results=10,
-                        safesearch="moderate",
-                    )
-
-                    for hit in hits:
-                        raw_url = hit.get("href") or hit.get("url") or ""
-                        title = (hit.get("title") or "Untitled").strip()
-                        snippet = (
-                            hit.get("body")
-                            or hit.get("snippet")
-                            or ""
-                        ).strip()
-
-                        if not raw_url:
-                            continue
-
-                        url = normalize_url(raw_url)
-                        parsed = urlparse(url)
-                        host = (parsed.hostname or "").lower()
-
-                        is_tg = host in {
-                            "t.me",
-                            "www.t.me",
-                            "telegram.me",
-                            "www.telegram.me",
-                        }
-
-                        if not is_tg:
-                            # Keep other pages only when they clearly
-                            # mention Telegram; label them as web sources.
-                            text = f"{title} {snippet}".lower()
-                            if "telegram" not in text:
-                                continue
-
-                        if url in seen:
-                            continue
-                        seen.add(url)
-
-                        handle = ""
-                        if is_tg:
-                            parts = parsed.path.strip("/").split("/")
-                            if parts:
-                                candidate = parts[0]
-                                if re.fullmatch(
-                                    r"[A-Za-z][A-Za-z0-9_]{3,}",
-                                    candidate,
-                                ):
-                                    handle = "@" + candidate
-
-                        searchable_text = f"{title} {snippet}".lower()
-                        target = name.lower()
-
-                        title_score = SequenceMatcher(
-                            None, target, title.lower()
-                        ).ratio()
-
-                        snippet_score = SequenceMatcher(
-                            None, target, snippet.lower()[:250]
-                        ).ratio()
-
-                        word_matches = sum(
-                            1 for word in target.split()
-                            if len(word) > 1 and word in searchable_text
-                        )
-                        words = max(1, len(target.split()))
-                        word_score = word_matches / words
-
-                        score = max(
-                            title_score,
-                            snippet_score * 0.85,
-                            word_score,
-                        )
-
-                        # Prioritize actual public Telegram pages.
-                        if is_tg:
-                            score = min(1.0, score + 0.08)
-
-                        results.append({
-                            "title": title[:150],
-                            "url": url,
-                            "handle": handle,
-                            "score": round(score * 100),
-                            "snippet": snippet[:250],
-                            "is_tg": is_tg,
-                        })
-
-                except Exception as exc:
-                    errors += 1
-                    print(
-                        f"Query failed ({type(exc).__name__}): "
-                        f"{query}"
-                    )
-
-    except Exception as exc:
-        print("Search provider unavailable:", type(exc).__name__)
-        raise RuntimeError("Public search provider unavailable") from exc
-
-    results.sort(
-        key=lambda item: (
-            item["is_tg"],
-            item["score"],
-        ),
-        reverse=True,
-    )
-
-    # Keep up to 8 unique public results.
-    return results[:8]
+def is_admin(update: Update) -> bool:
+    user = update.effective_user
+    return user is not None and user.id in ADMIN_USER_IDS
 
 
 async def start(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ):
-    if update.message:
-        await update.message.reply_text(
-            "🔎 Public Telegram Name Search\n\n"
-            "Usage:\n"
-            "/search Rahul Sharma\n\n"
-            "Searches public web indexes for pages mentioning "
-            "a name. It cannot search every Telegram account, "
-            "and results do not verify someone's identity."
+    if update.effective_message:
+        await update.effective_message.reply_text(
+            "Group-only name search bot\n\n"
+            "Usage: /search Rahul Sharma\n\n"
+            "Searches only the configured groups for accessible "
+            "participants and messages. Results may be incomplete."
         )
 
 
@@ -185,85 +90,157 @@ async def search(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ):
-    if not update.message:
+    message = update.effective_message
+
+    if not message:
         return
 
-    name = " ".join(context.args).strip()
-
-    if len(name) < 2:
-        await update.message.reply_text(
-            "Enter a name, e.g. /search Rahul Sharma"
-        )
+    if not is_admin(update):
+        await message.reply_text("⛔ You are not authorized to use this bot.")
         return
 
-    if len(name) > 100:
-        await update.message.reply_text(
-            "Please enter a name shorter than 100 characters."
-        )
+    query = " ".join(context.args).strip()
+
+    if len(query) < 2:
+        await message.reply_text("Usage: /search Rahul Sharma")
         return
 
-    status = await update.message.reply_text(
-        "🔍 Searching public web indexes. Please wait..."
+    if len(query) > 80:
+        await message.reply_text("Please use a shorter search query.")
+        return
+
+    status = await message.reply_text(
+        "🔎 Searching configured Telegram groups..."
     )
 
+    output = [f"Results for: {query}", ""]
+    total_hits = 0
+
     try:
-        results = await asyncio.to_thread(
-            search_public_web,
-            name,
+        for group_ref in ALLOWED_GROUPS:
+            try:
+                entity = await tg_client.get_entity(
+                    int(group_ref) if group_ref.lstrip("-").isdigit()
+                    else group_ref
+                )
+
+                group_name = getattr(entity, "title", None) or group_ref
+                public_name = getattr(entity, "username", None)
+
+                output.append(f"📂 Group: {group_name}")
+
+                # Participant search is best-effort and subject to Telegram limits.
+                try:
+                    members = []
+                    async for user in tg_client.iter_participants(
+                        entity,
+                        search=query,
+                        limit=10,
+                    ):
+                        display_name = " ".join(
+                            part for part in [
+                                getattr(user, "first_name", None),
+                                getattr(user, "last_name", None),
+                            ] if part
+                        ) or "(name unavailable)"
+
+                        username = (
+                            f"@{user.username}"
+                            if getattr(user, "username", None)
+                            else "No public username"
+                        )
+
+                        members.append(
+                            f"  • {display_name} — {username}"
+                        )
+
+                    output.append("Members:")
+                    output.extend(
+                        members if members else ["  • No accessible matches"]
+                    )
+                    total_hits += len(members)
+
+                except (RPCError, FloodWaitError) as exc:
+                    log.warning(
+                        "Member search failed in %s: %s",
+                        group_ref,
+                        type(exc).__name__,
+                    )
+                    output.append(
+                        "Members: unavailable (Telegram access/rate limit)"
+                    )
+
+                # Search messages available to this authorized account.
+                try:
+                    messages = []
+                    async for item in tg_client.iter_messages(
+                        entity,
+                        search=query,
+                        limit=10,
+                    ):
+                        text = (item.message or "").replace("\n", " ")
+                        if len(text) > 220:
+                            text = text[:217] + "..."
+
+                        if public_name:
+                            link = (
+                                f"https://t.me/{public_name}/{item.id}"
+                            )
+                            messages.append(f"  • {text}\n    {link}")
+                        else:
+                            messages.append(f"  • {text}")
+
+                    output.append("Messages:")
+                    output.extend(
+                        messages if messages else ["  • No indexed matches"]
+                    )
+                    total_hits += len(messages)
+
+                except (RPCError, FloodWaitError) as exc:
+                    log.warning(
+                        "Message search failed in %s: %s",
+                        group_ref,
+                        type(exc).__name__,
+                    )
+                    output.append(
+                        "Messages: unavailable (Telegram access/rate limit)"
+                    )
+
+                output.append("")
+
+            except Exception as exc:
+                log.warning(
+                    "Could not access configured group %s: %s",
+                    group_ref,
+                    type(exc).__name__,
+                )
+                output.extend([
+                    f"📂 Group: {group_ref}",
+                    "Could not access this group. Check the group reference, "
+                    "membership and permissions.",
+                    "",
+                ])
+
+        output.append(
+            f"Finished. Accessible matches: {total_hits}\n"
+            "Results may be incomplete. A name match does not verify identity."
         )
 
-        if not results:
-            await status.edit_text(
-                "No indexed public results found for this search.\n\n"
-                "Try another spelling or a shorter name. "
-                "This does not mean the Telegram account does not exist."
-            )
-            return
-
-        lines = [
-            f"🔎 Public search results for: {name}",
-            "",
-        ]
-
-        for i, item in enumerate(results, 1):
-            source_type = (
-                "Public Telegram page"
-                if item["is_tg"]
-                else "External web page"
-            )
-
-            lines.extend([
-                f"{i}. {item['title']}",
-                f"Type: {source_type}",
-                f"Username: {item['handle'] or 'Not found'}",
-                f"Text similarity: {item['score']}% "
-                "(not identity confidence)",
-                f"Link: {item['url']}",
-                f"Details: {item['snippet'] or 'No description indexed'}",
-                "",
-            ])
-
-        lines.append(
-            "⚠️ Results come from public search indexes. "
-            "They may be incomplete or unrelated. Verify each source yourself."
-        )
-
-        message = "\n".join(lines)
-
-        # Split at line boundaries to avoid cutting links/text.
+        # Keep each Telegram message below its size limit.
+        combined = "\n".join(output)
         chunks = []
         current = ""
 
-        for line in message.splitlines():
-            candidate = current + line + "\n"
-            if len(candidate) > 3800 and current:
+        for line in combined.splitlines():
+            if len(current) + len(line) + 1 > 3800:
                 chunks.append(current)
-                current = line + "\n"
-            else:
-                current = candidate
+                current = ""
+            current += line + "\n"
 
         if current:
             chunks.append(current)
+
+        await status.delete()
 
         for chunk in chunks:
             await update.effective_chat.send_message(
@@ -271,25 +248,27 @@ async def search(
                 disable_web_page_preview=True,
             )
 
-        await status.delete()
-
-    except Exception as exc:
-        print("Search failed:", type(exc).__name__)
-
+    except Exception:
+        log.exception("Search failed")
         await status.edit_text(
-            "⚠️ Public search is temporarily unavailable.\n"
-            "Please try again later."
+            "Search failed. Check GitHub Actions logs and configured secrets."
         )
 
 
 def main():
-    app = Application.builder().token(BOT_TOKEN).build()
+    application = (
+        Application.builder()
+        .token(BOT_TOKEN)
+        .post_init(post_init)
+        .post_shutdown(post_shutdown)
+        .build()
+    )
 
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("search", search))
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("search", search))
 
-    print("Bot started.")
-    app.run_polling()
+    log.info("Bot starting")
+    application.run_polling()
 
 
 if __name__ == "__main__":
